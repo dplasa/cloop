@@ -36,6 +36,9 @@
 #if (!(defined(CONFIG_DECOMPRESS_LZ4) || defined(CONFIG_DECOMPRESS_LZ4_MODULE)))
 #error  "Invalid Kernel configuration. CONFIG_LZ4_DECOMPRESS support is needed for cloop."
 #endif
+#if (!(defined(CONFIG_DECOMPRESS_LZMA) || defined(CONFIG_DECOMPRESS_LZMA_MODULE)))
+#error  "Invalid Kernel configuration. CONFIG_LZMA_DECOMPRESS support is needed for cloop."
+#endif
 
 #include <linux/kernel.h>
 #include <linux/version.h>
@@ -59,7 +62,7 @@
 #include <linux/lzo.h>
 /* Use LZ4 */
 #include <linux/lz4.h>
-/* Use kernel xz decoder FIXME DO REAL XZ DECODE LATER!!!!*/
+/* Use kernel xz decoder */
 #include <linux/xz.h>
 
 
@@ -145,6 +148,8 @@ struct cloop_device
  char **preload_cache;          /* Pointers to preloaded blocks */
 
  z_stream zstream;
+ struct xz_dec * xzdecoderstate;
+ struct xz_buf xz_buffer;
 
  struct file   *backing_file;  /* associated file */
  struct inode  *backing_inode; /* for bmap */
@@ -240,21 +245,35 @@ static int uncompress(struct cloop_device *clo, u_int32_t block_num, u_int32_t c
   else if (clo->info.flags[block_num] & CLOOP3_COMPRESSOR_LZ4)
   {
      size_t outputSize = clo->info.block_size;
-     if (block_num == clo->info.num_blocks-1) outputSize= MIN(outputSize, clo->info.original_size - block_num*clo->info.block_size);
-     #if (defined LZ4_INTERNAL)
-        err = LZ4_decompress_fast(clo->compressed_buffer, 
-              clo->buffer[clo->current_bufnum], 
-              outputSize); 
-     #else
-        err = lz4_decompress(clo->compressed_buffer, &compressed_length, 
-              clo->buffer[clo->current_bufnum], outputSize);
-              
-     #endif
+     if (block_num == clo->info.num_blocks-1)
+    	 outputSize= MIN(outputSize, clo->info.original_size - block_num*clo->info.block_size);
+	 err = lz4_decompress(clo->compressed_buffer, &compressed_length,
+		 clo->buffer[clo->current_bufnum], outputSize);
      if (err >= 0) 
      {
        err = 0;
        *uncompressed_length = outputSize;
      }
+  }
+  else if (clo->info.flags[block_num] & CLOOP3_COMPRESSOR_XZ)
+  {
+	clo->xz_buffer.in = clo->compressed_buffer;
+	clo->xz_buffer.in_pos = 0;
+	clo->xz_buffer.in_size = compressed_length;
+	clo->xz_buffer.out = clo->buffer[clo->current_bufnum];
+	clo->xz_buffer.out_pos = 0;
+	clo->xz_buffer.out_size = clo->info.block_size;
+	xz_dec_reset(clo->xzdecoderstate);
+	err = xz_dec_run(clo->xzdecoderstate, &clo->xz_buffer);
+	if (err == XZ_STREAM_END || err == XZ_OK)
+	{
+		err = 0;
+	}
+	else
+	{
+		printk(KERN_ERR "%s: xz_dec_run error %d\n", cloop_name, err);
+		err = 1;
+	}
   }
   else if (clo->info.flags[block_num] & CLOOP3_COMPRESSOR_ANY)
   {
@@ -802,8 +821,14 @@ static int cloop_set_file(int cloop_num, struct file *file, char *filename)
 			}
 			if (clo->allflags & CLOOP3_COMPRESSOR_XZ)
 			{
-				printk(KERN_ERR "%s: XZ not yet implemented\n", cloop_name);
-				error=-EINVAL; goto error_release;
+				#if XZ_INTERNAL_CRC32
+				/*
+				 * This must be called before any other xz_* function to initialize
+				 * the CRC32 lookup table.
+				 */
+				xz_crc32_init(void);
+				#endif
+				clo->xzdecoderstate = xz_dec_init(XZ_SINGLE, 0);
 			}
 			if (clo->allflags & CLOOP3_COMPRESSOR_LZ4)
 			{
@@ -1001,6 +1026,7 @@ static int cloop_clr_fd(int cloop_num, struct block_device *bdev)
   }
   if (clo->allflags & CLOOP3_COMPRESSOR_XZ)
   {
+	  xz_dec_end(clo->xzdecoderstate);
   }
   if(bdev) invalidate_bdev(bdev);
   if(clo->clo_disk) set_capacity(clo->clo_disk, 0);
